@@ -1,0 +1,111 @@
+import { GameLayout } from './GameLayout';
+import { Card } from './ui';
+import { Headline, RoundSummary as RoundSummaryType, FinalSummary } from '../hooks/useSocket';
+import { useGameTimeProgress } from '../hooks/useGameTimeProgress';
+
+interface JoinLobbyProps {
+  joinCode: string;
+  players: any[];
+  currentPlayerId: string;
+  isHost: boolean;
+  phase: string;
+  currentRound: number;
+  maxRounds: number;
+  playMinutes: number;
+  phaseStartedAt: string | null;
+  phaseEndsAt: string | null;
+  serverNow: string;
+  inGameNow: string | null;
+  timelineSpeedRatio: number;
+  headlines: Headline[];
+  roundSummary: RoundSummaryType | null;
+  finalSummary: FinalSummary | null;
+  onBack: () => void;
+  onSubmitHeadline: (headline: string) => Promise<{ success: boolean; error?: string; cooldownMs?: number }>;
+}
+
+export function JoinLobby({
+  joinCode,
+  players,
+  currentPlayerId,
+  isHost,
+  phase,
+  currentRound,
+  maxRounds,
+  playMinutes,
+  phaseStartedAt,
+  phaseEndsAt,
+  serverNow,
+  inGameNow,
+  timelineSpeedRatio,
+  headlines,
+  roundSummary,
+  finalSummary,
+  onBack,
+  onSubmitHeadline,
+}: JoinLobbyProps) {
+  const currentPlayer = players.find((p) => p.id === currentPlayerId);
+  const priorityPlanet = currentPlayer?.priorityPlanet ?? null;
+  const myScore = currentPlayer?.totalScore ?? 0;
+
+  const { totalGameMins, currentGameMins } = useGameTimeProgress({
+    phase,
+    currentRound,
+    maxRounds,
+    playMinutes,
+    phaseStartedAt,
+    serverNow,
+  });
+
+  const lobbyContent = (
+    <>
+      <div className="text-center space-y-1">
+        <h1 className="text-3xl font-bold text-gray-900">Waiting for Game</h1>
+        <p className="text-sm text-gray-500">
+          Session <span className="font-mono font-semibold">{joinCode}</span>
+        </p>
+      </div>
+
+      <Card padding="lg" className="text-center space-y-2">
+        <div className="flex items-center justify-center gap-2">
+          <div className="w-2.5 h-2.5 bg-emerald-400 rounded-full animate-pulse" />
+          <span className="text-sm text-gray-600">Connected</span>
+        </div>
+        <p className="text-xs text-gray-400">
+          {isHost
+            ? 'You are the host. Start the game when ready!'
+            : 'Waiting for the host to start the game...'}
+        </p>
+      </Card>
+
+      <p className="text-xs text-center text-gray-400">
+        More players can join using the invite link.
+      </p>
+    </>
+  );
+
+  return (
+    <GameLayout
+      joinCode={joinCode}
+      players={players}
+      currentPlayerId={currentPlayerId}
+      phase={phase}
+      currentRound={currentRound}
+      maxRounds={maxRounds}
+      phaseEndsAt={phaseEndsAt}
+      serverNow={serverNow}
+      inGameNow={inGameNow}
+      timelineSpeedRatio={timelineSpeedRatio}
+      headlines={headlines}
+      roundSummary={roundSummary}
+      finalSummary={finalSummary}
+      priorityPlanet={priorityPlanet}
+      myScore={myScore}
+      totalGameMins={totalGameMins}
+      currentGameMins={currentGameMins}
+      onSubmitHeadline={onSubmitHeadline}
+      onBack={onBack}
+      lobbyContent={lobbyContent}
+    />
+  );
+}

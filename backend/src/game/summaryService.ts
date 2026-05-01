@@ -1,0 +1,364 @@
+/**
+ * summary service for generating ai-powered round recaps.
+ * generates narrative summaries displayed during break phase.
+ */
+
+import pool from '../db/pool.js';
+import {
+  createOpenAIClient,
+  OpenAIClient,
+  OpenAIError,
+} from '../llm/openaiResponsesClient.js';
+import {
+  buildSummaryPrompt,
+  buildSummaryInstructions,
+  summaryJsonSchema,
+} from '../llm/summaryPrompt.js';
+import {
+  buildNarrativePrompt,
+  buildNarrativeInstructions,
+  narrativeJsonSchema,
+} from '../llm/narrativePrompt.js';
+import {
+  GenerateSummaryParams,
+  GenerateNarrativeParams,
+  SummaryResult,
+  NarrativeResult,
+  RoundSummaryOutput,
+  NarrativeSummaryOutput,
+  RoundHeadlineInput,
+  SummaryStatus,
+} from '../llm/summaryTypes.js';
+
+const PLAUSIBILITY_LABELS: Record<number, string> = {
+  1: 'inevitable',
+  2: 'probable',
+  3: 'plausible',
+  4: 'possible',
+  5: 'preposterous',
+};
+
+/** singleton client instance */
+let clientInstance: OpenAIClient | null = null;
+
+/**
+ * get or create the openai client.
+ * uses environment variables for configuration.
+ */
+function getClient(): OpenAIClient {
+  if (!clientInstance) {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      throw new OpenAIError(
+        'OPENAI_API_KEY environment variable is not set',
+        'MISSING_API_KEY'
+      );
+    }
+
+    clientInstance = createOpenAIClient({
+      apiKey,
+      model: process.env.OPENAI_MODEL || 'gpt-5.2',
+      baseUrl: process.env.OPENAI_BASE_URL || 'https://api.openai.com',
+    });
+  }
+
+  return clientInstance;
+}
+
+/**
+ * reset the client instance (for testing).
+ */
+export function resetSummaryClient(): void {
+  clientInstance = null;
+}
+
+/**
+ * set a custom client instance (for testing).
+ */
+export function setSummaryClient(client: OpenAIClient): void {
+  clientInstance = client;
+}
+
+/**
+ * fetch all headlines for a range of rounds (inclusive).
+ */
+async function fetchHeadlinesInRange(
+  sessionId: string,
+  fromRound: number,
+  toRound: number
+): Promise<RoundHeadlineInput[]> {
+  const result = await pool.query(
+    `SELECT
+      h.id,
+      COALESCE(h.selected_headline, h.headline_text) as headline,
+      h.headline_text as story_direction,
+      h.plausibility_level,
+      h.planet_1,
+      h.planet_2,
+      h.planet_3,
+      p.nickname as player
+    FROM game_session_headlines h
+    JOIN session_players p ON h.player_id = p.id
+    WHERE h.session_id = $1 AND h.round_no BETWEEN $2 AND $3
+    ORDER BY h.created_at ASC`,
+    [sessionId, fromRound, toRound]
+  );
+
+  return result.rows.map((row) => ({
+    headline: row.headline || row.story_direction,
+    player: row.player,
+    plausibilityLevel: row.plausibility_level || 3,
+    plausibilityLabel: PLAUSIBILITY_LABELS[row.plausibility_level] || 'plausible',
+    planets: [row.planet_1, row.planet_2, row.planet_3].filter(Boolean),
+    storyDirection: row.story_direction,
+  }));
+}
+
+/**
+ * create or update a summary record with 'generating' status.
+ */
+async function markSummaryGenerating(
+  sessionId: string,
+  roundNo: number,
+  summaryType: 'historical' | 'narrative' = 'historical'
+): Promise<string> {
+  const result = await pool.query(
+    `INSERT INTO round_summaries (session_id, round_no, status, summary_data, summary_type)
+     VALUES ($1, $2, 'generating', '{}', $3)
+     ON CONFLICT (session_id, round_no)
+     DO UPDATE SET status = 'generating', error_message = NULL, summary_type = $3
+     RETURNING id`,
+    [sessionId, roundNo, summaryType]
+  );
+  return result.rows[0].id;
+}
+
+/**
+ * update a summary record with completed data.
+ */
+async function markSummaryCompleted(
+  summaryId: string,
+  summaryData: RoundSummaryOutput | NarrativeSummaryOutput,
+  model: string,
+  inputTokens: number | undefined,
+  outputTokens: number | undefined,
+  llmRequest: Record<string, unknown>,
+  llmResponse: string
+): Promise<void> {
+  await pool.query(
+    `UPDATE round_summaries
+     SET status = 'completed',
+         summary_data = $2,
+         llm_model = $3,
+         llm_input_tokens = $4,
+         llm_output_tokens = $5,
+         llm_request = $6,
+         llm_response = $7,
+         completed_at = CURRENT_TIMESTAMP
+     WHERE id = $1`,
+    [
+      summaryId,
+      JSON.stringify(summaryData),
+      model,
+      inputTokens ?? null,
+      outputTokens ?? null,
+      JSON.stringify(llmRequest),
+      llmResponse,
+    ]
+  );
+}
+
+/**
+ * update a summary record with error status.
+ */
+async function markSummaryError(summaryId: string, errorMessage: string): Promise<void> {
+  await pool.query(
+    `UPDATE round_summaries
+     SET status = 'error',
+         error_message = $2,
+         completed_at = CURRENT_TIMESTAMP
+     WHERE id = $1`,
+    [summaryId, errorMessage]
+  );
+}
+
+/**
+ * generate a round summary using ai.
+ *
+ * @param params - session id, round number, and max rounds
+ * @returns the generated summary with metadata
+ * @throws {OpenAIError} if the api call fails
+ */
+export async function generateRoundSummary(
+  params: GenerateSummaryParams
+): Promise<SummaryResult> {
+  const { sessionId, fromRound, toRound, maxRounds } = params;
+
+  // store the summary keyed by toRound (the most recent round in the range)
+  const summaryId = await markSummaryGenerating(sessionId, toRound);
+
+  try {
+    const headlines = await fetchHeadlinesInRange(sessionId, fromRound, toRound);
+
+    const prompt = buildSummaryPrompt({
+      fromRound,
+      toRound,
+      totalRounds: maxRounds,
+      headlines,
+    });
+    const instructions = buildSummaryInstructions();
+
+    const client = getClient();
+    const result = await client.callResponsesApi<RoundSummaryOutput>({
+      input: prompt,
+      instructions,
+      jsonSchema: summaryJsonSchema,
+    });
+
+    await markSummaryCompleted(
+      summaryId,
+      result.output,
+      result.model,
+      result.usage?.inputTokens,
+      result.usage?.outputTokens,
+      { prompt, instructions },
+      result.rawText
+    );
+
+    return {
+      summary: result.output,
+      model: result.model,
+      usage: result.usage,
+    };
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    await markSummaryError(summaryId, errorMessage);
+    throw error;
+  }
+}
+
+/**
+ * fetch all headlines from a session in chronological order, formatted
+ * as `[YYYY-MM] headline` for the narrative prompt.
+ */
+async function fetchAllHeadlinesForNarrative(
+  sessionId: string
+): Promise<Array<{ date: string; headline: string }>> {
+  const result = await pool.query(
+    `SELECT
+      to_char(in_game_submitted_at, 'YYYY-MM') as date,
+      COALESCE(selected_headline, headline_text) as headline
+    FROM game_session_headlines
+    WHERE session_id = $1 AND in_game_submitted_at IS NOT NULL
+    ORDER BY in_game_submitted_at ASC`,
+    [sessionId]
+  );
+  return result.rows.map((row) => ({
+    date: row.date,
+    headline: row.headline,
+  }));
+}
+
+/**
+ * generate the final game-end narrative summary.
+ *
+ * unlike the historical recap used during break, this generates a set
+ * of fictional first-person experience reports from different characters
+ * living through the timeline.
+ *
+ * stored in `round_summaries` with `summary_type = 'narrative'`, keyed
+ * by `round_no = maxRounds`.
+ */
+export async function generateFinalNarrativeSummary(
+  params: GenerateNarrativeParams
+): Promise<NarrativeResult> {
+  const { sessionId, maxRounds } = params;
+
+  // store keyed by maxRounds with summary_type = 'narrative'
+  const summaryId = await markSummaryGenerating(sessionId, maxRounds, 'narrative');
+
+  try {
+    const headlines = await fetchAllHeadlinesForNarrative(sessionId);
+
+    const prompt = buildNarrativePrompt({ headlines });
+    const instructions = buildNarrativeInstructions();
+
+    const client = getClient();
+    const result = await client.callResponsesApi<NarrativeSummaryOutput>({
+      input: prompt,
+      instructions,
+      jsonSchema: narrativeJsonSchema,
+    });
+
+    await markSummaryCompleted(
+      summaryId,
+      result.output,
+      result.model,
+      result.usage?.inputTokens,
+      result.usage?.outputTokens,
+      { prompt, instructions },
+      result.rawText
+    );
+
+    return {
+      summary: result.output,
+      model: result.model,
+      usage: result.usage,
+    };
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    await markSummaryError(summaryId, errorMessage);
+    throw error;
+  }
+}
+
+/**
+ * get an existing round summary from the database.
+ *
+ * @param sessionId - the session id
+ * @param roundNo - the round number
+ * @returns the summary data and status, or null if not found
+ */
+export async function getRoundSummary(
+  sessionId: string,
+  roundNo: number
+): Promise<{
+  status: SummaryStatus;
+  summaryType: 'historical' | 'narrative';
+  summary: RoundSummaryOutput | NarrativeSummaryOutput | null;
+  error: string | null;
+} | null> {
+  const result = await pool.query(
+    `SELECT status, summary_data, summary_type, error_message
+     FROM round_summaries
+     WHERE session_id = $1 AND round_no = $2`,
+    [sessionId, roundNo]
+  );
+
+  if (result.rows.length === 0) {
+    return null;
+  }
+
+  const row = result.rows[0];
+  return {
+    status: row.status as SummaryStatus,
+    summaryType: (row.summary_type as 'historical' | 'narrative') ?? 'historical',
+    summary: row.status === 'completed' ? row.summary_data : null,
+    error: row.error_message,
+  };
+}
+
+/**
+ * get session id from join code.
+ *
+ * @param joinCode - the session join code
+ * @returns the session id or null if not found
+ */
+export async function getSessionIdFromJoinCode(joinCode: string): Promise<string | null> {
+  const result = await pool.query(
+    `SELECT id FROM game_sessions WHERE join_code = $1`,
+    [joinCode]
+  );
+
+  return result.rows.length > 0 ? result.rows[0].id : null;
+}

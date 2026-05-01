@@ -1,0 +1,2 @@
+ALTER TABLE session_players
+  ADD COLUMN is_system BOOLEAN NOT NULL DEFAULT FALSE;
